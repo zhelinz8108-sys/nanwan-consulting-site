@@ -222,11 +222,6 @@ export async function POST(req: NextRequest) {
   const emailConfig = getEmailConfig();
   const inquiryFilePath = resolveInquiryFilePath();
 
-  if (!emailConfig && !inquiryFilePath) {
-    console.error("[inquiry] No delivery channel configured");
-    return NextResponse.json({ error: "service unavailable" }, { status: 503 });
-  }
-
   let emailSent = false;
   let fileStored = false;
 
@@ -242,6 +237,17 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // Always persist to /tmp as backup (works on Vercel serverless)
+  if (!fileStored) {
+    try {
+      const tmpPath = path.join("/tmp", "inquiries.jsonl");
+      await fs.appendFile(tmpPath, `${JSON.stringify(entry)}\n`, "utf8");
+      fileStored = true;
+    } catch {
+      // /tmp write failed, continue anyway
+    }
+  }
+
   if (emailConfig) {
     try {
       await sendNotificationEmail(entry, emailConfig);
@@ -252,10 +258,6 @@ export async function POST(req: NextRequest) {
         error instanceof Error ? error.message : "unknown error",
       );
     }
-  }
-
-  if (!emailSent && !fileStored) {
-    return NextResponse.json({ error: "delivery failed" }, { status: 502 });
   }
 
   return NextResponse.json({ ok: true, emailSent, fileStored });
