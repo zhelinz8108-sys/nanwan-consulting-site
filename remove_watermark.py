@@ -3,120 +3,108 @@
 用法: python remove_watermark.py
 """
 import os
-import cv2
-import numpy as np
-import subprocess
 import sys
+import numpy as np
 
 # ===== 配置 =====
-VIDEO_FILE = "#1801.MP4"
+VIDEO_FILE = "video.mp4"
 PROPAINTER_DIR = os.path.dirname(os.path.abspath(__file__))
 FRAMES_DIR = os.path.join(PROPAINTER_DIR, "inputs", "watermark", "frames")
 MASKS_DIR = os.path.join(PROPAINTER_DIR, "inputs", "watermark", "masks")
 OUTPUT_DIR = os.path.join(PROPAINTER_DIR, "results")
 VIDEO_PATH = os.path.join(PROPAINTER_DIR, VIDEO_FILE)
 
+
 def step1_extract_frames():
-    """第1步：从视频提取所有帧"""
+    """提取视频帧（用 av 库）"""
+    import av
+    import cv2
     print("=" * 50)
     print("第1步：提取视频帧...")
     os.makedirs(FRAMES_DIR, exist_ok=True)
 
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        print(f"错误：无法打开视频 {VIDEO_PATH}")
-        sys.exit(1)
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"  视频信息: {w}x{h}, {fps:.1f}fps, {total}帧, {total/fps:.1f}秒")
+    container = av.open(VIDEO_PATH)
+    stream = container.streams.video[0]
+    w = stream.width
+    h = stream.height
+    fps = float(stream.average_rate)
+    total = stream.frames
+    print(f"  视频: {w}x{h}, {fps:.1f}fps, {total}帧, {total/fps:.1f}秒")
 
     count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        cv2.imwrite(os.path.join(FRAMES_DIR, f"{count:05d}.jpg"), frame)
+    for frame in container.decode(video=0):
+        img = frame.to_ndarray(format='bgr24')
+        cv2.imwrite(os.path.join(FRAMES_DIR, f"{count:05d}.jpg"), img)
         count += 1
-        if count % 30 == 0:
+        if count % 100 == 0:
             print(f"  已提取 {count}/{total} 帧...")
 
-    cap.release()
-    print(f"  完成！共提取 {count} 帧")
+    container.close()
+    print(f"  完成！共 {count} 帧")
     return w, h, fps, count
 
-def step2_create_mask():
-    """第2步：自动检测水印位置并生成 mask"""
+
+def step2_create_mask(w, h):
+    """生成水印遮罩"""
+    import cv2
     print("=" * 50)
-    print("第2步：生成水印遮罩 (mask)...")
+    print("第2步：生成水印遮罩...")
     os.makedirs(MASKS_DIR, exist_ok=True)
 
-    # 读取第一帧作为参考
-    first_frame_path = os.path.join(FRAMES_DIR, "00000.jpg")
-    frame = cv2.imread(first_frame_path)
-    if frame is None:
-        print("错误：无法读取第一帧")
-        sys.exit(1)
-
-    h, w = frame.shape[:2]
-
-    # 创建黑色 mask（黑色=保留，白色=去除）
+    # 读取第一帧
+    first_frame = cv2.imread(os.path.join(FRAMES_DIR, "00000.jpg"))
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    # 水印位置（根据截图中6个水印的大概位置）
-    # 视频是竖屏的，水印分布在画面中间区域
-    # 这里用相对坐标，适配不同分辨率
-
-    watermark_regions = [
-        # (x比例, y比例, 宽比例, 高比例) - 相对于视频尺寸
-        # 左列 - OVERSEAS STUDENT SERVICE logo + 文字
-        (0.12, 0.18, 0.28, 0.12),  # 左上水印
-        (0.12, 0.38, 0.28, 0.12),  # 左中水印
-        (0.12, 0.58, 0.28, 0.12),  # 左下水印
-        # 右列 - 美笑房产 USWOO
-        (0.55, 0.18, 0.28, 0.10),  # 右上水印
-        (0.55, 0.38, 0.28, 0.10),  # 右中水印
-        (0.55, 0.58, 0.28, 0.10),  # 右下水印
+    # 视频 960x1706 竖屏，水印分布：
+    # 左列3个: OVERSEAS STUDENT SERVICE (logo + 文字)
+    # 右列3个: 美笑房产 USWOO (红色块)
+    watermarks = [
+        # (x1, y1, x2, y2) 像素坐标 for 960x1706
+        # 左上 - logo + OVERSEAS STUDENT SERVICE
+        (130, 240, 380, 360),
+        # 左中
+        (130, 480, 380, 600),
+        # 左下
+        (130, 720, 380, 840),
+        # 右上 - 美笑房产 USWOO
+        (500, 250, 720, 350),
+        # 右中
+        (500, 490, 720, 590),
+        # 右下
+        (500, 730, 720, 830),
     ]
 
-    for (rx, ry, rw, rh) in watermark_regions:
-        x1 = int(rx * w)
-        y1 = int(ry * h)
-        x2 = int((rx + rw) * w)
-        y2 = int((ry + rh) * h)
-        # 稍微扩大区域确保覆盖
-        pad_x = int(0.02 * w)
-        pad_y = int(0.02 * h)
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(w, x2 + pad_x)
-        y2 = min(h, y2 + pad_y)
+    pad = 15  # 额外扩展像素
+    for (x1, y1, x2, y2) in watermarks:
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(w, x2 + pad)
+        y2 = min(h, y2 + pad)
         mask[y1:y2, x1:x2] = 255
 
-    # 保存 mask 预览（带框线的原图，方便检查）
-    preview = frame.copy()
-    mask_color = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    mask_color[mask > 0] = [0, 0, 255]  # 红色标注
-    preview = cv2.addWeighted(preview, 0.7, mask_color, 0.3, 0)
+    # 保存预览
+    preview = first_frame.copy()
+    overlay = preview.copy()
+    overlay[mask > 0] = [0, 0, 255]
+    preview = cv2.addWeighted(preview, 0.6, overlay, 0.4, 0)
     cv2.imwrite(os.path.join(PROPAINTER_DIR, "mask_preview.jpg"), preview)
-    print(f"  mask 预览已保存到 mask_preview.jpg，请检查红色区域是否覆盖了所有水印")
 
-    # 为每一帧生成相同的 mask
-    frame_files = sorted(os.listdir(FRAMES_DIR))
+    # 为每帧生成 mask
+    frame_files = sorted([f for f in os.listdir(FRAMES_DIR) if f.endswith('.jpg')])
     for fname in frame_files:
-        mask_path = os.path.join(MASKS_DIR, fname.replace(".jpg", ".png"))
-        cv2.imwrite(mask_path, mask)
+        cv2.imwrite(os.path.join(MASKS_DIR, fname.replace(".jpg", ".png")), mask)
 
-    print(f"  完成！共生成 {len(frame_files)} 个 mask 文件")
-    return mask
+    print(f"  完成！mask_preview.jpg 已生成")
+    print(f"  请打开 mask_preview.jpg 检查红色区域是否覆盖水印")
+    return len(frame_files)
 
-def step3_run_propainter(total_frames):
-    """第3步：运行 ProPainter 去水印"""
+
+def step3_run(total_frames):
+    """运行 ProPainter"""
+    import subprocess
     print("=" * 50)
-    print("第3步：运行 ProPainter AI 去水印...")
-    print("  这一步需要一些时间，请耐心等待...")
+    print("第3步：AI 去水印处理中...")
+    print(f"  共 {total_frames} 帧，请耐心等待...")
 
     cmd = [
         sys.executable,
@@ -124,61 +112,49 @@ def step3_run_propainter(total_frames):
         "--video", os.path.join("inputs", "watermark", "frames"),
         "--mask", os.path.join("inputs", "watermark", "masks"),
         "--output", OUTPUT_DIR,
-        "--resize_ratio", "1.0",
-        "--height", "-1",
-        "--width", "-1",
+        "--resize_ratio", "0.5",
         "--ref_stride", "10",
         "--neighbor_length", "10",
         "--subvideo_length", "80",
-        "--save_frames",
     ]
 
-    # 如果帧数太多，降低分辨率加速
-    if total_frames > 300:
-        print(f"  视频较长({total_frames}帧)，使用0.5倍分辨率加速处理...")
-        cmd[cmd.index("1.0")] = "0.5"
-
-    print(f"  执行命令: {' '.join(cmd)}")
+    print(f"  命令: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=PROPAINTER_DIR)
 
     if result.returncode == 0:
-        print("  ProPainter 处理完成！")
+        print("\n  处理完成！")
     else:
-        print(f"  ProPainter 出错了，返回码: {result.returncode}")
-        sys.exit(1)
+        print(f"\n  出错，返回码: {result.returncode}")
+
 
 def main():
     print("=" * 50)
-    print("南湾去水印工具 v1.0 (基于 ProPainter)")
+    print("  视频去水印工具 (ProPainter)")
     print("=" * 50)
 
     if not os.path.exists(VIDEO_PATH):
-        print(f"错误：找不到视频文件 {VIDEO_PATH}")
-        print(f"请确保视频文件在: {PROPAINTER_DIR}")
+        print(f"错误：找不到 {VIDEO_PATH}")
         sys.exit(1)
 
-    # 检查模型文件
-    weights_dir = os.path.join(PROPAINTER_DIR, "weights")
-    required = ["ProPainter.pth", "recurrent_flow_completion.pth", "raft-things.pth"]
-    for f in required:
-        if not os.path.exists(os.path.join(weights_dir, f)):
-            print(f"错误：缺少模型文件 weights/{f}")
+    # 检查模型
+    for f in ["ProPainter.pth", "recurrent_flow_completion.pth", "raft-things.pth"]:
+        if not os.path.exists(os.path.join(PROPAINTER_DIR, "weights", f)):
+            print(f"错误：缺少 weights/{f}")
             sys.exit(1)
-    print("模型文件检查通过 ✓")
+    print("模型检查通过 ✓\n")
 
-    w, h, fps, total = step1_extract_frames()
-    step2_create_mask()
+    w, h, fps, count = step1_extract_frames()
+    total = step2_create_mask(w, h)
+
+    print("\n打开 mask_preview.jpg 看看红色区域对不对。")
+    input("没问题按 Enter 开始去水印（Ctrl+C 取消）...")
+
+    step3_run(total)
 
     print("\n" + "=" * 50)
-    print("请打开 mask_preview.jpg 检查红色区域是否覆盖了所有水印。")
-    input("确认无误后按 Enter 继续运行 AI 去水印（或 Ctrl+C 取消）...")
-
-    step3_run_propainter(total)
-
-    print("\n" + "=" * 50)
-    print("全部完成！输出文件在:")
-    print(f"  {OUTPUT_DIR}")
+    print(f"输出在: {OUTPUT_DIR}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()
